@@ -2,8 +2,6 @@ package main
 
 import (
 	"bytes"
-	"crypto/sha256"
-	"encoding/hex"
 	"io"
 	"log"
 	"net/http"
@@ -17,125 +15,194 @@ import (
 
 // Main function
 func main() {
-	// The location to the remote URL.
+	// Remote URL to download HTML content from
 	remoteURL := "https://yuneec.online/download/"
-	// The location to the local file for the remote url.
+
+	// Local file path to save downloaded HTML content
 	localHTMLFileRemoteLocation := "yuneec.html"
-	outputDir := "PDFs/"             // Target directory to save PDFs
-	if !directoryExists(outputDir) { // If directory doesn't exist
-		createDirectory(outputDir, 0755) // Create directory with standard permissions
+
+	// Directory to store PDF files
+	outputDir := "PDFs/"
+	// Create outputDir if it does not exist
+	if !directoryExists(outputDir) {
+		createDirectory(outputDir, 0755)
 	}
-	// Download the remote url file to the local file.
+
+	// Directory to store ZIP files
+	zipOutputDir := "ZIP/"
+	// Create zipOutputDir if it does not exist
+	if !directoryExists(zipOutputDir) {
+		createDirectory(zipOutputDir, 0755)
+	}
+
+	// Download HTML file if not already downloaded
 	if !fileExists(localHTMLFileRemoteLocation) {
-		// Download the content and save it to the file.
 		getDataFromURL(remoteURL, localHTMLFileRemoteLocation)
 	}
+
 	var readFileContent string
-	// Check if the file exists.
+	// If HTML file exists, read its content into a string
 	if fileExists(localHTMLFileRemoteLocation) {
 		readFileContent = readAFileAsString(localHTMLFileRemoteLocation)
 	}
-	// Extract all the .pdf urls from the content.
+
+	// Extract all PDF URLs from the HTML content
 	extractedPDFURLOnly := extractPDFUrls(readFileContent)
-	// Remove duplicates from the given slice.
+	// Remove duplicate PDF URLs
 	extractedPDFURLOnly = removeDuplicatesFromSlice(extractedPDFURLOnly)
-	// Loop over the downloaded URL.
+
+	// Extract all ZIP URLs from the HTML content
+	extractedZIPFilesOnly := extractZIPUrls(readFileContent)
+	// Remove duplicate ZIP URLs
+	extractedPDFURLOnly = removeDuplicatesFromSlice(extractedPDFURLOnly)
+
+	// Download each valid and unique PDF file
 	for _, url := range extractedPDFURLOnly {
 		url = "https://yuneec.online" + url
 		if isUrlValid(url) {
 			downloadPDF(url, outputDir)
 		}
 	}
+
+	// Download each valid and unique ZIP file
+	for _, url := range extractedZIPFilesOnly {
+		url = "https://yuneec.online" + url
+		if isUrlValid(url) {
+			downloadZIP(url, zipOutputDir)
+		}
+	}
 }
 
-// Get the file extension of a path
+// downloadZIP downloads a ZIP file from a URL to the specified directory
+func downloadZIP(finalURL string, outputDir string) {
+	// Generate safe filename from URL
+	rawFilename := urlToFilename(finalURL)
+	filename := strings.ToLower(rawFilename)
+
+	// Build the full file path
+	filePath := filepath.Join(outputDir, filename)
+	// Skip download if file already exists
+	if fileExists(filePath) {
+		log.Printf("file already exists, skipping: %s", filePath)
+		return
+	}
+
+	// Create HTTP client with timeout
+	client := &http.Client{Timeout: 3 * time.Minute}
+	resp, err := client.Get(finalURL)
+	if err != nil {
+		log.Printf("error fetching %s: %v", finalURL, err)
+		return
+	}
+	defer resp.Body.Close()
+
+	// Check for valid HTTP response
+	if resp.StatusCode != http.StatusOK {
+		log.Printf("bad status code for %s: %d", finalURL, resp.StatusCode)
+		return
+	}
+
+	// Check content type to ensure it's a ZIP file
+	ct := resp.Header.Get("Content-Type")
+	if !strings.Contains(ct, "application/zip") && !strings.Contains(ct, "application/octet-stream") {
+		log.Printf("unexpected content type for %s: %s", finalURL, ct)
+		return
+	}
+
+	// Read response body into memory
+	var buf bytes.Buffer
+	written, err := buf.ReadFrom(resp.Body)
+	if err != nil || written == 0 {
+		log.Printf("error reading body from %s: %v", finalURL, err)
+		return
+	}
+
+	// Create and write to local file
+	out, err := os.Create(filePath)
+	if err != nil {
+		log.Printf("error creating file %s: %v", filePath, err)
+		return
+	}
+	defer out.Close()
+
+	if _, err := buf.WriteTo(out); err != nil {
+		log.Printf("error writing to file %s: %v", filePath, err)
+		return
+	}
+
+	log.Printf("downloaded: %s", filePath)
+}
+
+// getFileExtension returns the file extension of the path
 func getFileExtension(path string) string {
-	return filepath.Ext(path) // Return extension (e.g. .pdf)
+	return filepath.Ext(path)
 }
 
-// generateHash takes a string input and returns its SHA-256 hash as a hex string
-func generateHash(input string) string {
-	// Compute SHA-256 hash of the input converted to a byte slice
-	hash := sha256.Sum256([]byte(input))
-
-	// Convert the hash bytes to a hexadecimal string and return it
-	return hex.EncodeToString(hash[:])
-}
-
-// Convert a URL into a safe filename format
+// urlToFilename creates a safe filename from a URL string
 func urlToFilename(rawURL string) string {
-	// Lets turn that text into a hash
-	sanitized := generateHash(rawURL)
-
-	// Ensure the filename ends in .pdf
-	if getFileExtension(sanitized) != ".pdf" {
-		sanitized = sanitized + ".pdf"
+	remoteURLFileEXT := getFileExtension(rawURL)
+	lower := strings.ToLower(remoteURLFileEXT)
+	lower = filepath.Base(rawURL)
+	reNonAlnum := regexp.MustCompile(`[^a-z0-9]`)
+	safe := reNonAlnum.ReplaceAllString(lower, "_")
+	safe = regexp.MustCompile(`_+`).ReplaceAllString(safe, "_")
+	var invalidSubstrings = []string{"_zip", "_pdf"}
+	for _, invalidPre := range invalidSubstrings {
+		safe = removeSubstring(safe, invalidPre)
 	}
-
-	return strings.ToLower(sanitized) // Return the final, normalized, lowercase filename
+	if after, ok := strings.CutPrefix(safe, "_"); ok {
+		safe = after
+	}
+	if getFileExtension(safe) != remoteURLFileEXT {
+		safe = safe + remoteURLFileEXT
+	}
+	return safe
 }
 
-// downloadPDF downloads the PDF at finalURL into outputDir.
-// It sends only one HTTP GET request, extracts filename from headers if needed,
-// and skips download if the file already exists locally.
+// removeSubstring removes all instances of a substring from a string
+func removeSubstring(input string, toRemove string) string {
+	return strings.ReplaceAll(input, toRemove, "")
+}
+
+// downloadPDF downloads a PDF file from a URL to the specified directory
 func downloadPDF(finalURL string, outputDir string) {
-	// Derive a safe filename from the URL
-	rawFilename := urlToFilename(finalURL)   // convert URL to base filename
-	filename := strings.ToLower(rawFilename) // normalize filename to lowercase
-
-	// Compute initial file path and check for existing file
-	filePath := filepath.Join(outputDir, filename) // join directory and filename
-	if fileExists(filePath) {                      // if file already exists locally
-		log.Printf("file already exists, skipping: %s", filePath) // log skip event
+	rawFilename := urlToFilename(finalURL)
+	filename := strings.ToLower(rawFilename)
+	filePath := filepath.Join(outputDir, filename)
+	if fileExists(filePath) {
+		log.Printf("file already exists, skipping: %s", filePath)
 		return
 	}
-
-	// Perform single GET request (fetch headers + body)
-	client := &http.Client{Timeout: 3 * time.Minute} // create HTTP client with timeout
-	resp, err := client.Get(finalURL)                // send GET request
-	if err != nil {                                  // handle request error
+	client := &http.Client{Timeout: 3 * time.Minute}
+	resp, err := client.Get(finalURL)
+	if err != nil {
 		return
 	}
-	defer resp.Body.Close() // ensure response body is closed
-
-	// Verify HTTP status is OK
-	if resp.StatusCode != http.StatusOK { // check for 200 OK
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
 		return
 	}
-
-	// Ensure content is a PDF
-	ct := resp.Header.Get("Content-Type")         // get Content-Type header
-	if !strings.Contains(ct, "application/pdf") { // check for "application/pdf"
+	ct := resp.Header.Get("Content-Type")
+	if !strings.Contains(ct, "application/pdf") {
 		return
 	}
-
-	// Read response body into buffer
-	var buf bytes.Buffer                    // create in-memory buffer
-	written, err := buf.ReadFrom(resp.Body) // read all data into buffer
-	if err != nil {                         // handle read error
+	var buf bytes.Buffer
+	written, err := buf.ReadFrom(resp.Body)
+	if err != nil || written == 0 {
 		return
 	}
-	if written == 0 { // check for empty download
+	out, err := os.Create(filePath)
+	if err != nil {
 		return
 	}
-
-	// Create file and write buffer to disk
-	out, err := os.Create(filePath) // open file for writing
-	if err != nil {                 // handle create error
-		return
-	}
-	defer out.Close()                           // ensure file is closed
-	if _, err := buf.WriteTo(out); err != nil { // write buffer to file
-		return
-	}
+	defer out.Close()
+	buf.WriteTo(out)
 }
 
-// extractPDFUrls takes an input string and returns all PDF URLs found within href attributes
+// extractPDFUrls finds all PDF links in a string
 func extractPDFUrls(input string) []string {
-	// Regular expression to match href="...pdf"
 	re := regexp.MustCompile(`href="([^"]+\.pdf)"`)
 	matches := re.FindAllStringSubmatch(input, -1)
-
 	var pdfUrls []string
 	for _, match := range matches {
 		if len(match) > 1 {
@@ -145,78 +212,78 @@ func extractPDFUrls(input string) []string {
 	return pdfUrls
 }
 
-// Read a file and return the contents
+// extractZIPUrls finds all ZIP links in a string
+func extractZIPUrls(input string) []string {
+	re := regexp.MustCompile(`href="([^"]+\.zip)"`)
+	matches := re.FindAllStringSubmatch(input, -1)
+	var pdfUrls []string
+	for _, match := range matches {
+		if len(match) > 1 {
+			pdfUrls = append(pdfUrls, match[1])
+		}
+	}
+	return pdfUrls
+}
+
+// readAFileAsString reads the entire file and returns it as a string
 func readAFileAsString(path string) string {
-	content, err := os.ReadFile(path) // Read the full file content into memory
+	content, err := os.ReadFile(path)
 	if err != nil {
-		log.Fatalln(err) // Fatal log and exit if reading fails
+		log.Fatalln(err)
 	}
-	return string(content) // Return contents as a string
+	return string(content)
 }
 
-// Check whether a given file exists and is not a directory
+// fileExists checks whether a given file exists
 func fileExists(filename string) bool {
-	info, err := os.Stat(filename) // Get file or directory info
-	if err != nil {                // If an error occurs (e.g., file not found)
-		return false // File doesn't exist or error occurred
+	info, err := os.Stat(filename)
+	if err != nil {
+		return false
 	}
-	return !info.IsDir() // Return true if it's a file (not a folder)
+	return !info.IsDir()
 }
 
-// Check whether a directory exists
+// directoryExists checks whether a given directory exists
 func directoryExists(path string) bool {
-	directory, err := os.Stat(path) // Get file or directory info
+	directory, err := os.Stat(path)
 	if err != nil {
-		return false // Doesn't exist or error occurred
+		return false
 	}
-	return directory.IsDir() // True if it is a directory
+	return directory.IsDir()
 }
 
-// Create a directory with the specified permissions
+// createDirectory creates a directory with specified permissions
 func createDirectory(path string, permission os.FileMode) {
-	err := os.Mkdir(path, permission) // Create the directory with given permissions
+	err := os.Mkdir(path, permission)
 	if err != nil {
-		log.Println(err) // Log error if creation fails
+		log.Println(err)
 	}
 }
 
-// getDataFromURL performs an HTTP GET request to the specified URI,
-// waits for up to 1 minute for the server response, and writes the response body to a file.
-// It includes error handling and logs meaningful messages at each step.
+// getDataFromURL fetches content from a URL and writes it to a file
 func getDataFromURL(uri string, fileName string) {
-	// Create an HTTP client with a 1-minute timeout
 	client := http.Client{
-		Timeout: 3 * time.Minute, // Set a timeout of 1 minute for the request
+		Timeout: 3 * time.Minute,
 	}
-
-	// Perform the GET request using the custom client
 	response, err := client.Get(uri)
-	if err != nil { // If the request fails due to timeout or other network issues
+	if err != nil {
 		log.Println("Failed to make GET request:", err)
 		return
 	}
-
-	// Check if the server responded with a non-200 OK status
 	if response.StatusCode != http.StatusOK {
 		log.Println("Unexpected status code from", uri, "->", response.StatusCode)
 		return
 	}
-
-	// Read the entire body of the response
 	body, err := io.ReadAll(response.Body)
 	if err != nil {
 		log.Println("Failed to read response body:", err)
 		return
 	}
-
-	// Ensure the response body is properly closed to free resources
 	err = response.Body.Close()
 	if err != nil {
 		log.Println("Failed to close response body:", err)
 		return
 	}
-
-	// Save the response body content to the specified file
 	err = appendByteToFile(fileName, body)
 	if err != nil {
 		log.Println("Failed to write to file:", err)
@@ -224,32 +291,32 @@ func getDataFromURL(uri string, fileName string) {
 	}
 }
 
-// Append byte data to a file, create file if it doesn't exist
+// appendByteToFile writes data to a file, appending or creating it if needed
 func appendByteToFile(filename string, data []byte) error {
-	file, err := os.OpenFile(filename, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644) // Open file in append/create mode
+	file, err := os.OpenFile(filename, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 	if err != nil {
-		return err // Return error if failed
+		return err
 	}
-	defer file.Close()        // Ensure file is closed when function exits
-	_, err = file.Write(data) // Write byte data to file
-	return err                // Return any write error
+	defer file.Close()
+	_, err = file.Write(data)
+	return err
 }
 
-// Remove duplicate strings from a slice
+// removeDuplicatesFromSlice removes duplicate entries from a string slice
 func removeDuplicatesFromSlice(slice []string) []string {
-	check := make(map[string]bool)  // Map to track whether a URL was already added
-	var newReturnSlice []string     // Slice to store unique items
-	for _, content := range slice { // Loop through the input slice
-		if !check[content] { // If content not already added
-			check[content] = true                            // Mark it as seen
-			newReturnSlice = append(newReturnSlice, content) // Add it to the result slice
+	check := make(map[string]bool)
+	var newReturnSlice []string
+	for _, content := range slice {
+		if !check[content] {
+			check[content] = true
+			newReturnSlice = append(newReturnSlice, content)
 		}
 	}
-	return newReturnSlice // Return slice with unique values
+	return newReturnSlice
 }
 
-// Check if a URL is valid and parseable
+// isUrlValid checks if a string is a valid URL
 func isUrlValid(uri string) bool {
-	_, err := url.ParseRequestURI(uri) // Try parsing the URL using standard library
-	return err == nil                  // Return true if parsing succeeds (i.e., URL is valid)
+	_, err := url.ParseRequestURI(uri)
+	return err == nil
 }
